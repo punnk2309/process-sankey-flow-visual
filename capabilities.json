@@ -1,0 +1,63 @@
+{
+  "dataRoles": [
+    {
+      "name": "source",
+      "kind": "Grouping",
+      "displayName": "Source",
+      "description": "Source node name"
+    },
+    {
+      "name": "target",
+      "kind": "Grouping",
+      "displayName": "Target",
+      "description": "Target node name"
+    },
+    {
+      "name": "value",
+      "kind": "Measure",
+      "displayName": "Value / Amount",
+      "description": "Flow value between source and target"
+    },
+    {
+      "name": "columnOrder",
+      "kind": "Grouping",
+      "displayName": "Column Order (Optional)",
+      "description": "Manually set which column a node belongs to (0, 1, 2...)"
+    }
+  ],
+  "dataViewMappings": [
+    {
+      "table": {
+        "rows": {
+          "select": [
+            { "for": { "in": "source" } },
+            { "for": { "in": "target" } },
+            { "for": { "in": "value" } },
+            { "for": { "in": "columnOrder" } }
+          ]
+        }
+      }
+    }
+  ],
+  "objects": {
+    "general": {
+      "properties": {
+        "filter": {
+          "type": {
+            "filter": {}
+          }
+        }
+      }
+    },
+    "nodePositions": {
+      "properties": {
+        "positions": {
+          "type": { "text": true }
+        }
+      }
+    }
+  },
+  "supportsHighlight": true,
+  "suppressDefaultTitle": true,
+  "privileges": []
+}

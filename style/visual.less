@@ -1,0 +1,27 @@
+/** Sankey Visual Styles **/
+
+:local(.visual-container) {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    position: relative;
+    font-family: "Segoe UI", sans-serif;
+}
+
+svg {
+    display: block;
+}
+
+text {
+    user-select: none;
+    pointer-events: none;
+}
+
+.sankey-node rect {
+    transition: fill-opacity 0.12s ease;
+}
+
+.sankey-node rect:first-child {
+    cursor: grab;
+    &:active { cursor: grabbing; }
+}
