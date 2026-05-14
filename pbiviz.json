@@ -17,5 +17,6 @@
   "assets": {
     "icon": "assets/icon.png"
   },
+  "capabilities": "capabilities.json",
   "stringResources": []
 }
