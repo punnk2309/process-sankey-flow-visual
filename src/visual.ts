@@ -10,22 +10,26 @@ import IVisualHost = powerbi.extensibility.visual.IVisualHost;
 import DataView = powerbi.DataView;
 
 interface NodePosition {
-    x: number;
+    colIndex: number;
     y: number;
     w: number;
-    h: number;
+    // h is not persisted — always recomputed from live data
 }
 
 interface SankeyNode {
     id: string;
     label: string;
     column: number;
+    colIndex: number;
     x: number;
     y: number;
     w: number;
     h: number;
     color: string;
-    value: number;
+    value: number;   // max(inflow, outflow) — drives height
+    inflow: number;  // sum of links where this node is target (data direction)
+    outflow: number; // sum of links where this node is source (data direction)
+    selfLoop: number; // sum of self-loop link values
 }
 
 interface SankeyLink {
@@ -41,26 +45,26 @@ export class Visual implements IVisual {
     private container: HTMLDivElement;
     private tooltip: HTMLDivElement;
 
-    // Persisted positions survive filter changes
     private savedPositions: Map<string, NodePosition> = new Map();
-    // Current visible nodes and links
     private nodes: Map<string, SankeyNode> = new Map();
     private links: SankeyLink[] = [];
-    // SVG layer references for re-rendering links during drag/resize
     private defs: SVGDefsElement | null = null;
     private linkLayer: SVGGElement | null = null;
 
-    // Stable color assignment per node id
     private colorMap: Map<string, string> = new Map();
     private colorIdx = 0;
 
+    private numColumns: number = 4;
+    private vpW: number = 600;
+    private vpH: number = 400;
+    private scaleF: number = 1; // pixels per flow-value unit
+    private selfLoopLayer: SVGGElement | null = null;
+
+    private readonly PAD = { t: 50, r: 100, b: 30, l: 100 };
     private readonly NODE_W = 24;
-    private readonly NODE_MIN_W = 12;
-    private readonly NODE_MIN_H = 16;
-    private readonly HANDLE = 8;
     private readonly LINK_OPACITY = 0.45;
-    private readonly MAX_LINK_THICK = 60;
     private readonly COL_SPACING = 12;
+    private readonly ARROW_SIZE = 6;
 
     private readonly COLORS = [
         "#2196F3","#4CAF50","#FF9800","#E91E63","#9C27B0",
@@ -100,6 +104,9 @@ export class Visual implements IVisual {
             return;
         }
 
+        this.vpW = options.viewport.width;
+        this.vpH = options.viewport.height;
+
         this.loadSavedPositions(dataView);
 
         const { nodes, links } = this.parseData(dataView);
@@ -110,37 +117,56 @@ export class Visual implements IVisual {
 
         this.assignColumns(nodes, links);
         this.detectBackward(nodes, links);
+        this.preAssignColIndex(nodes);   // needed so computeNodeValues can use colIndex
         this.computeNodeValues(nodes, links);
-        this.layoutNodes(nodes, options.viewport.width, options.viewport.height);
+        this.layoutNodes(nodes, links);
 
         this.nodes = nodes;
         this.links = links;
-        this.renderAll(options.viewport.width, options.viewport.height);
+        this.renderAll();
     }
 
-    // ── Data parsing ───────────────────────────────────────────────────────────
+    // ── Persistence loading ────────────────────────────────────────────────────
 
     private loadSavedPositions(dataView: DataView) {
         try {
             const raw = (dataView.metadata?.objects as any)?.nodePositions?.positions as string | undefined;
             if (raw) {
-                const parsed = JSON.parse(raw) as Record<string, NodePosition>;
-                this.savedPositions = new Map(Object.entries(parsed));
+                const parsed = JSON.parse(raw) as Record<string, any>;
+                this.savedPositions = new Map(
+                    Object.entries(parsed).map(([id, p]) => {
+                        if (typeof p.colIndex === "number") {
+                            return [id, { colIndex: p.colIndex, y: p.y, w: p.w }] as [string, NodePosition];
+                        } else {
+                            const innerW = Math.max(this.vpW - this.PAD.l - this.PAD.r, 100);
+                            const gap = this.numColumns > 1 ? innerW / (this.numColumns - 1) : 1;
+                            const ci = Math.round((p.x - this.PAD.l) / gap);
+                            return [id, { colIndex: Math.max(0, ci), y: p.y, w: p.w ?? this.NODE_W }] as [string, NodePosition];
+                        }
+                    })
+                );
             }
-        } catch { /* ignore corrupt data */ }
+        } catch { /* ignore */ }
+
+        try {
+            const count = (dataView.metadata?.objects as any)?.columnCount?.count as number | undefined;
+            if (typeof count === "number" && count >= 1) {
+                this.numColumns = Math.round(count);
+            }
+        } catch { /* ignore */ }
     }
+
+    // ── Data parsing ───────────────────────────────────────────────────────────
 
     private parseData(dataView: DataView) {
         const { columns, rows } = dataView.table!;
         let si = -1, ti = -1, vi = -1;
 
-        // Prefer role-based mapping
         columns.forEach((col, i) => {
             if (col.roles?.["source"]) si = i;
             else if (col.roles?.["target"]) ti = i;
             else if (col.roles?.["value"]) vi = i;
         });
-        // Fallback: match by display name
         if (si === -1 || ti === -1 || vi === -1) {
             columns.forEach((col, i) => {
                 const n = col.displayName.toLowerCase();
@@ -174,7 +200,7 @@ export class Visual implements IVisual {
         if (!this.colorMap.has(id)) {
             this.colorMap.set(id, this.COLORS[this.colorIdx++ % this.COLORS.length]);
         }
-        return { id, label: id, column: 0, x: 0, y: 0, w: this.NODE_W, h: 60, color: this.colorMap.get(id)!, value: 0 };
+        return { id, label: id, column: 0, colIndex: 0, x: 0, y: 0, w: this.NODE_W, h: 60, color: this.colorMap.get(id)!, value: 0, inflow: 0, outflow: 0, selfLoop: 0 };
     }
 
     private assignColumns(nodes: Map<string, SankeyNode>, links: SankeyLink[]) {
@@ -208,21 +234,50 @@ export class Visual implements IVisual {
         });
     }
 
+    private preAssignColIndex(nodes: Map<string, SankeyNode>) {
+        const maxCol = nodes.size ? Math.max(...Array.from(nodes.values()).map(n => n.column)) : 0;
+        const numDataCols = maxCol + 1;
+        nodes.forEach(n => {
+            if (this.savedPositions.has(n.id)) {
+                const p = this.savedPositions.get(n.id)!;
+                n.colIndex = Math.max(0, Math.min(this.numColumns - 1, p.colIndex));
+            } else {
+                const snap = Math.round(n.column * (this.numColumns - 1) / Math.max(numDataCols - 1, 1));
+                n.colIndex = Math.max(0, Math.min(this.numColumns - 1, snap));
+            }
+        });
+    }
+
     private computeNodeValues(nodes: Map<string, SankeyNode>, links: SankeyLink[]) {
-        const fwd = links.filter(l => !l.isBackward);
+        // Heights and displayed stats are based purely on DATA direction (source/target fields),
+        // NOT on visual column position — so moving nodes never changes the numbers or height.
         nodes.forEach((node, id) => {
-            const inflow  = fwd.filter(l => l.target === id).reduce((s, l) => s + l.value, 0);
-            const outflow = fwd.filter(l => l.source === id).reduce((s, l) => s + l.value, 0);
-            node.value = Math.max(inflow, outflow, 1);
+            node.inflow   = links.filter(l => l.target === id && l.source !== id).reduce((s, l) => s + l.value, 0);
+            node.outflow  = links.filter(l => l.source === id && l.target !== id).reduce((s, l) => s + l.value, 0);
+            node.selfLoop = links.filter(l => l.source === id && l.target === id).reduce((s, l) => s + l.value, 0);
+            node.value = Math.max(node.inflow, node.outflow, 1);
         });
     }
 
     // ── Layout ─────────────────────────────────────────────────────────────────
 
-    private layoutNodes(nodes: Map<string, SankeyNode>, vw: number, vh: number) {
-        const pad = { t: 30, r: 90, b: 30, l: 90 };
-        const innerW = Math.max(vw - pad.l - pad.r, 100);
-        const innerH = Math.max(vh - pad.t - pad.b, 100);
+    private colX(colIndex: number): number {
+        const innerW = Math.max(this.vpW - this.PAD.l - this.PAD.r, 100);
+        const gap = this.numColumns > 1 ? innerW / (this.numColumns - 1) : 0;
+        return this.PAD.l + colIndex * gap;
+    }
+
+    private nearestColIndex(nodeX: number, nodeW: number): number {
+        const cx = nodeX + nodeW / 2;
+        const innerW = Math.max(this.vpW - this.PAD.l - this.PAD.r, 100);
+        const gap = this.numColumns > 1 ? innerW / (this.numColumns - 1) : 1;
+        const ci = Math.round((cx - this.PAD.l) / gap);
+        return Math.max(0, Math.min(this.numColumns - 1, ci));
+    }
+
+    private layoutNodes(nodes: Map<string, SankeyNode>, links?: SankeyLink[]) {
+        const activeLinks = links ?? this.links;
+        const innerH = Math.max(this.vpH - this.PAD.t - this.PAD.b, 100);
 
         const byCols = new Map<number, SankeyNode[]>();
         nodes.forEach(n => {
@@ -230,49 +285,94 @@ export class Visual implements IVisual {
             byCols.get(n.column)!.push(n);
         });
 
-        const numCols = Math.max(0, ...byCols.keys()) + 1;
-        const colGap  = numCols > 1 ? innerW / (numCols - 1) : 0;
+        const numDataCols = Math.max(0, ...byCols.keys()) + 1;
+
+        // Global scaleF: pixels per flow-unit, limited by most constrained column
+        let minScale = Infinity;
+        byCols.forEach(colNodes => {
+            const totalVal = colNodes.reduce((s, n) => s + n.value, 0) || 1;
+            const spacing = this.COL_SPACING;
+            const totalSpace = spacing * Math.max(0, colNodes.length - 1);
+            const availH = Math.max(1, innerH - totalSpace);
+            const scale = availH / totalVal;
+            if (scale < minScale) minScale = scale;
+        });
+        this.scaleF = isFinite(minScale) ? minScale : 1;
 
         byCols.forEach((colNodes, colIdx) => {
             colNodes.sort((a, b) => b.value - a.value);
-            const totalVal = colNodes.reduce((s, n) => s + n.value, 0) || 1;
+            const spacing = this.COL_SPACING;
 
-            // Apply saved positions immediately so new nodes can flow around them
-            colNodes.forEach(node => {
-                if (this.savedPositions.has(node.id)) {
-                    const p = this.savedPositions.get(node.id)!;
-                    node.x = p.x; node.y = p.y; node.w = p.w; node.h = p.h;
-                }
+            // Node height = scaleF * value so it exactly equals the sum of link thicknesses
+            colNodes.forEach(n => {
+                n.h = Math.max(4, this.scaleF * n.value);
             });
 
-            // Auto-layout nodes without a saved position
-            const newNodes = colNodes.filter(n => !this.savedPositions.has(n.id));
-            const spacing    = this.COL_SPACING;
-            const totalSpace = spacing * Math.max(0, newNodes.length - 1);
-            const availH     = innerH - totalSpace;
-            let y = pad.t;
+            const savedNodes = colNodes.filter(n => this.savedPositions.has(n.id));
+            const newNodes   = colNodes.filter(n => !this.savedPositions.has(n.id));
 
-            newNodes.forEach(node => {
-                const nodeH = Math.max(this.NODE_MIN_H, Math.min(200, (node.value / totalVal) * availH));
-                const cx    = numCols > 1 ? pad.l + colIdx * colGap : pad.l + innerW / 2;
-                node.x = cx - this.NODE_W / 2;
-                node.y = y;
-                node.w = this.NODE_W;
-                node.h = nodeH;
-                y += nodeH + spacing;
+            savedNodes.forEach(n => {
+                const p = this.savedPositions.get(n.id)!;
+                n.colIndex = Math.max(0, Math.min(this.numColumns - 1, p.colIndex));
+                n.x = this.colX(n.colIndex) - p.w / 2;
+                n.y = p.y;
+                n.w = p.w;
             });
+
+            const snapCol = Math.round(colIdx * (this.numColumns - 1) / Math.max(numDataCols - 1, 1));
+            let y = this.PAD.t;
+            newNodes.forEach(n => {
+                n.colIndex = Math.max(0, Math.min(this.numColumns - 1, snapCol));
+                n.w = this.NODE_W;
+                n.x = this.colX(n.colIndex) - n.w / 2;
+                n.y = y;
+                y += n.h + spacing;
+            });
+        });
+
+        // Expand node heights to guarantee connections never overflow the node body.
+        // Accumulate actual ribbon thickness per edge (right edge of left node, left edge of right node)
+        // using the same colIndex logic as renderLinks, then floor node.h to that total.
+        // Source/target values are untouched — only the visual bar grows.
+        const rightEdge = new Map<string, number>();
+        const leftEdge  = new Map<string, number>();
+        nodes.forEach((_, id) => { rightEdge.set(id, 0); leftEdge.set(id, 0); });
+        activeLinks.filter(l => l.source !== l.target).forEach(link => {
+            const src = nodes.get(link.source);
+            const tgt = nodes.get(link.target);
+            if (!src || !tgt) return;
+            const thick = Math.max(2, this.scaleF * link.value);
+            const leftNode  = src.colIndex <= tgt.colIndex ? src : tgt;
+            const rightNode = src.colIndex <= tgt.colIndex ? tgt : src;
+            rightEdge.set(leftNode.id,  (rightEdge.get(leftNode.id)  || 0) + thick);
+            leftEdge.set(rightNode.id,  (leftEdge.get(rightNode.id)  || 0) + thick);
+        });
+        nodes.forEach(n => {
+            const re = rightEdge.get(n.id) || 0;
+            const le = leftEdge.get(n.id)  || 0;
+            n.h = Math.max(n.h, re, le);
+        });
+
+        // Clamp all nodes to stay within the SVG viewport
+        nodes.forEach(n => {
+            n.x = Math.max(this.PAD.l - n.w / 2, Math.min(this.vpW - this.PAD.r - n.w / 2, n.x));
+            n.y = Math.max(this.PAD.t, Math.min(this.vpH - this.PAD.b - n.h, n.y));
         });
     }
 
     // ── Rendering ──────────────────────────────────────────────────────────────
 
-    private renderAll(width: number, height: number) {
+    private renderAll() {
         while (this.svg.firstChild) this.svg.removeChild(this.svg.firstChild);
-        this.svg.setAttribute("width", String(width));
-        this.svg.setAttribute("height", String(height));
+        this.svg.setAttribute("width", String(this.vpW));
+        this.svg.setAttribute("height", String(this.vpH));
 
         this.defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
         this.svg.appendChild(this.defs);
+
+        const guideLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        this.svg.appendChild(guideLayer);
+        this.renderColumnGuides(guideLayer);
 
         this.linkLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
         this.svg.appendChild(this.linkLayer);
@@ -280,103 +380,334 @@ export class Visual implements IVisual {
         const nodeLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
         this.svg.appendChild(nodeLayer);
 
+        this.selfLoopLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        const selfLoopLayer = this.selfLoopLayer;
+        this.svg.appendChild(selfLoopLayer);
+
+        const toolbarLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        this.svg.appendChild(toolbarLayer);
+        this.renderToolbar(toolbarLayer);
+
         this.renderLinks();
         this.renderNodes(nodeLayer);
+        this.renderSelfLoops(selfLoopLayer);
     }
+
+    private refreshSelfLoops() {
+        if (!this.selfLoopLayer) return;
+        while (this.selfLoopLayer.firstChild) this.selfLoopLayer.removeChild(this.selfLoopLayer.firstChild);
+        this.renderSelfLoops(this.selfLoopLayer);
+    }
+
+    private renderSelfLoops(layer: SVGGElement) {
+        this.links.filter(l => l.source === l.target).forEach(link => {
+            const node = this.nodes.get(link.source);
+            if (!node) return;
+            const thick = Math.max(3, Math.min(this.scaleF * link.value, node.w * 0.55, 28));
+            this.drawSelfLoop(link, node, thick, layer);
+        });
+    }
+
+    private drawSelfLoop(link: SankeyLink, node: SankeyNode, thick: number, layer: SVGGElement) {
+        const halfW = node.w * 0.42;
+        const archH = Math.max(34, thick * 2.5 + 10);
+        const cx = node.x + node.w / 2;
+        const y0 = node.y;
+
+        const xOL = cx - halfW;
+        const xOR = cx + halfW;
+        const ins = Math.min(thick, halfW * 0.85);
+        const xIL = xOL + ins;
+        const xIR = xOR - ins;
+
+        const d = [
+            `M ${xOL} ${y0}`,
+            `C ${xOL} ${y0 - archH} ${xOR} ${y0 - archH} ${xOR} ${y0}`,
+            `L ${xIR} ${y0}`,
+            `C ${xIR} ${y0 - archH + ins * 1.3} ${xIL} ${y0 - archH + ins * 1.3} ${xIL} ${y0}`,
+            "Z"
+        ].join(" ");
+
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", d);
+        path.setAttribute("fill", node.color);
+        path.setAttribute("fill-opacity", "0.42");
+        path.setAttribute("stroke", node.color);
+        path.setAttribute("stroke-width", "1");
+        path.setAttribute("stroke-opacity", "0.55");
+        path.style.cursor = "default";
+        path.addEventListener("mouseenter", (e) => {
+            path.setAttribute("fill-opacity", "0.72");
+            this.showTooltip(e as MouseEvent, `${link.source} ↺: ${link.value.toLocaleString()} (self-loop)`);
+        });
+        path.addEventListener("mouseleave", () => {
+            path.setAttribute("fill-opacity", "0.42");
+            this.hideTooltip();
+        });
+        layer.appendChild(path);
+
+        // Arrowhead at top of arch pointing left (top-right band → top-left band)
+        // Use reversed outer arch bezier: P0=(xOR,y0) P1=(xOR,y0-archH) P2=(xOL,y0-archH) P3=(xOL,y0)
+        const mid = this.bezierPt(xOR, y0, xOR, y0 - archH, xOL, y0 - archH, xOL, y0, 0.5);
+        const s = this.ARROW_SIZE;
+        const arrow = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+        arrow.setAttribute("points", `${-s},${-s * 0.55} ${s},0 ${-s},${s * 0.55}`);
+        arrow.setAttribute("fill", node.color);
+        arrow.setAttribute("fill-opacity", "0.85");
+        arrow.setAttribute("transform", `translate(${mid.x.toFixed(1)},${mid.y.toFixed(1)}) rotate(${mid.angle.toFixed(1)})`);
+        arrow.style.pointerEvents = "none";
+        layer.appendChild(arrow);
+    }
+
+    private renderColumnGuides(layer: SVGGElement) {
+        for (let i = 0; i < this.numColumns; i++) {
+            const cx = this.colX(i);
+            const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            line.setAttribute("x1", String(cx));
+            line.setAttribute("y1", String(this.PAD.t));
+            line.setAttribute("x2", String(cx));
+            line.setAttribute("y2", String(this.vpH - this.PAD.b));
+            line.setAttribute("stroke", "#ccc");
+            line.setAttribute("stroke-width", "1");
+            line.setAttribute("stroke-dasharray", "4 4");
+            layer.appendChild(line);
+        }
+    }
+
+    private renderToolbar(layer: SVGGElement) {
+        const btnW = 22, btnH = 22, gap = 4;
+        // Anchor to right-inside of right padding so it never leaves the SVG
+        const x0 = this.vpW - this.PAD.r + 8;
+        const y0 = 6;
+
+        const makeBtn = (x: number, label: string, onClick: () => void) => {
+            const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+            g.style.cursor = "pointer";
+
+            const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+            rect.setAttribute("x", String(x));
+            rect.setAttribute("y", String(y0));
+            rect.setAttribute("width", String(btnW));
+            rect.setAttribute("height", String(btnH));
+            rect.setAttribute("rx", "3");
+            rect.setAttribute("fill", "#e0e0e0");
+            rect.setAttribute("stroke", "#aaa");
+            rect.setAttribute("stroke-width", "1");
+
+            const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            text.setAttribute("x", String(x + btnW / 2));
+            text.setAttribute("y", String(y0 + btnH / 2));
+            text.setAttribute("text-anchor", "middle");
+            text.setAttribute("dominant-baseline", "middle");
+            text.setAttribute("font-size", "14");
+            text.setAttribute("font-family", "Segoe UI, sans-serif");
+            text.setAttribute("fill", "#333");
+            text.setAttribute("pointer-events", "none");
+            text.textContent = label;
+
+            g.appendChild(rect);
+            g.appendChild(text);
+            g.addEventListener("mouseenter", () => rect.setAttribute("fill", "#bdbdbd"));
+            g.addEventListener("mouseleave", () => rect.setAttribute("fill", "#e0e0e0"));
+            g.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
+            g.addEventListener("click", (e) => {
+                e.stopPropagation();
+                onClick();
+            });
+            layer.appendChild(g);
+        };
+
+        makeBtn(x0, "−", () => {
+            if (this.numColumns > 1) {
+                this.numColumns--;
+                this.persistColumnCount();
+                this.layoutNodes(this.nodes);
+                this.renderAll();
+            }
+        });
+
+        const countLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        countLabel.setAttribute("x", String(x0 + btnW + gap + 14));
+        countLabel.setAttribute("y", String(y0 + btnH / 2));
+        countLabel.setAttribute("text-anchor", "middle");
+        countLabel.setAttribute("dominant-baseline", "middle");
+        countLabel.setAttribute("font-size", "11");
+        countLabel.setAttribute("font-family", "Segoe UI, sans-serif");
+        countLabel.setAttribute("fill", "#555");
+        countLabel.textContent = String(this.numColumns);
+        countLabel.style.pointerEvents = "none";
+        layer.appendChild(countLabel);
+
+        makeBtn(x0 + btnW + gap + 28, "+", () => {
+            if (this.numColumns < 20) {
+                this.numColumns++;
+                this.persistColumnCount();
+                this.layoutNodes(this.nodes);
+                this.renderAll();
+            }
+        });
+    }
+
+    // ── Link rendering (Bezier curves + directional arrows) ────────────────────
 
     private renderLinks() {
         if (!this.linkLayer || !this.defs) return;
         while (this.linkLayer.firstChild) this.linkLayer.removeChild(this.linkLayer.firstChild);
         while (this.defs.firstChild) this.defs.removeChild(this.defs.firstChild);
 
-        // Track how far down each node's edge we've used so far
-        const srcOff = new Map<string, number>();
-        const tgtOff = new Map<string, number>();
-        this.nodes.forEach((_, id) => { srcOff.set(id, 0); tgtOff.set(id, 0); });
+        // Routing is purely colIndex-based:
+        //   left node (smaller colIndex) → right-edge exit
+        //   right node (larger colIndex) → left-edge entry
+        // All connections between the same pair share the same two offset pools,
+        // so bidirectional flows stack together instead of splitting across sides.
+        const rightOff = new Map<string, number>(); // right-edge exits (node is left of partner)
+        const leftOff  = new Map<string, number>(); // left-edge entries (node is right of partner)
+        this.nodes.forEach((_, id) => { rightOff.set(id, 0); leftOff.set(id, 0); });
 
-        const totalFlow = this.links.filter(l => !l.isBackward).reduce((s, l) => s + l.value, 0) || 1;
-
-        // Draw forward links first, then backward
-        const sorted = [...this.links].sort((a, b) => (a.isBackward ? 1 : 0) - (b.isBackward ? 1 : 0));
+        // Self-loops are rendered separately above nodes — exclude from offset pools
+        const sorted = [...this.links]
+            .filter(l => l.source !== l.target)
+            .sort((a, b) => (a.isBackward ? 1 : 0) - (b.isBackward ? 1 : 0));
 
         sorted.forEach((link, i) => {
             const src = this.nodes.get(link.source);
             const tgt = this.nodes.get(link.target);
             if (!src || !tgt) return;
 
-            // Thickness proportional to flow value
-            const thick   = Math.max(2, (link.value / totalFlow) * this.MAX_LINK_THICK);
-            const capped  = Math.min(thick, src.h * 0.88, tgt.h * 0.88);
+            const thick = Math.max(2, this.scaleF * link.value);
+            const halfT = thick / 2;
 
-            const so = srcOff.get(link.source) || 0;
-            const to = tgtOff.get(link.target) || 0;
-            srcOff.set(link.source, so + capped);
-            tgtOff.set(link.target, to + capped);
+            // Determine which node is visually to the left based on current snap column
+            const srcIsLeft = src.colIndex <= tgt.colIndex;
+            const leftNode  = srcIsLeft ? src : tgt;
+            const rightNode = srcIsLeft ? tgt : src;
 
-            // Determine attachment points
-            let x1: number, y1: number, x2: number, y2: number;
-            if (link.isBackward) {
-                x1 = src.x;             y1 = src.y + so + capped / 2;
-                x2 = tgt.x + tgt.w;    y2 = tgt.y + to + capped / 2;
-            } else {
-                x1 = src.x + src.w;    y1 = src.y + so + capped / 2;
-                x2 = tgt.x;            y2 = tgt.y + to + capped / 2;
-            }
+            // Always route: right edge of left node → left edge of right node
+            const ro = rightOff.get(leftNode.id) || 0;
+            const lo = leftOff.get(rightNode.id) || 0;
+            const x1 = leftNode.x + leftNode.w;  const y1 = leftNode.y + ro + halfT;
+            const x2 = rightNode.x;               const y2 = rightNode.y + lo + halfT;
+            rightOff.set(leftNode.id, ro + thick);
+            leftOff.set(rightNode.id, lo + thick);
 
-            // Gradient along flow direction
+            // Gradient: left-node color → right-node color (matches visual ribbon position)
             const gradId = `g${i}`;
             const grad = document.createElementNS("http://www.w3.org/2000/svg", "linearGradient");
             grad.setAttribute("id", gradId);
             grad.setAttribute("gradientUnits", "userSpaceOnUse");
             grad.setAttribute("x1", String(x1)); grad.setAttribute("y1", String(y1));
             grad.setAttribute("x2", String(x2)); grad.setAttribute("y2", String(y2));
-
-            for (const [off, color] of [[0, src.color], [1, tgt.color]] as [number, string][]) {
+            // Flow goes right-to-left when !srcIsLeft, so swap stop colors
+            const c0 = leftNode.color, c1 = rightNode.color;
+            const opacity = srcIsLeft ? this.LINK_OPACITY : 0.32;
+            for (const [off, color] of [[0, c0], [1, c1]] as [number, string][]) {
                 const stop = document.createElementNS("http://www.w3.org/2000/svg", "stop");
                 stop.setAttribute("offset", String(off));
                 stop.setAttribute("stop-color", color);
-                stop.setAttribute("stop-opacity", String(link.isBackward ? 0.3 : this.LINK_OPACITY));
+                stop.setAttribute("stop-opacity", String(opacity));
                 grad.appendChild(stop);
             }
             this.defs.appendChild(grad);
 
-            // Bezier ribbon path
-            const dx   = Math.abs(x2 - x1) * 0.5;
-            const cpx1 = link.isBackward ? x1 - dx : x1 + dx;
-            const cpx2 = link.isBackward ? x2 + dx : x2 - dx;
-            const half  = capped / 2;
-
-            const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-            path.setAttribute("d", [
-                `M ${x1} ${y1 - half}`,
-                `C ${cpx1} ${y1 - half}, ${cpx2} ${y2 - half}, ${x2} ${y2 - half}`,
-                `L ${x2} ${y2 + half}`,
-                `C ${cpx2} ${y2 + half}, ${cpx1} ${y1 + half}, ${x1} ${y1 + half}`,
-                "Z"
-            ].join(" "));
-            path.setAttribute("fill", `url(#${gradId})`);
-
-            if (link.isBackward) {
-                path.setAttribute("stroke", src.color);
-                path.setAttribute("stroke-width", "1");
-                path.setAttribute("stroke-dasharray", "4 3");
-                path.setAttribute("stroke-opacity", "0.5");
-            }
-
-            path.style.cursor = "default";
-            path.addEventListener("mouseenter", (e) => {
-                path.style.opacity = "0.72";
-                const label = `${link.source} → ${link.target}: ${link.value.toLocaleString()}${link.isBackward ? "  ↩ backward" : ""}`;
-                this.showTooltip(e as MouseEvent, label);
-            });
-            path.addEventListener("mouseleave", () => {
-                path.style.opacity = "";
-                this.hideTooltip();
-            });
-
-            this.linkLayer.appendChild(path);
+            this.drawLink(link, src, tgt, x1, y1, x2, y2, halfT, gradId, srcIsLeft, i);
         });
     }
+
+    private drawLink(
+        link: SankeyLink,
+        src: SankeyNode, tgt: SankeyNode,
+        x1: number, y1: number, x2: number, y2: number,
+        halfT: number, gradId: string, srcIsLeft: boolean, idx: number
+    ) {
+        // Bezier always goes left→right geometrically (x1 < x2).
+        // When !srcIsLeft the flow is right→left — arrowheads are reversed.
+        const dx = (x2 - x1) * 0.5;
+        const cpx1 = x1 + dx;  const cpy1 = y1;
+        const cpx2 = x2 - dx;  const cpy2 = y2;
+
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", [
+            `M ${x1} ${y1 - halfT}`,
+            `C ${cpx1} ${y1 - halfT}, ${cpx2} ${y2 - halfT}, ${x2} ${y2 - halfT}`,
+            `L ${x2} ${y2 + halfT}`,
+            `C ${cpx2} ${y2 + halfT}, ${cpx1} ${y1 + halfT}, ${x1} ${y1 + halfT}`,
+            "Z"
+        ].join(" "));
+        path.setAttribute("fill", `url(#${gradId})`);
+
+        // Right-to-left flows get a dashed stroke to distinguish direction
+        if (!srcIsLeft) {
+            path.setAttribute("stroke", src.color);
+            path.setAttribute("stroke-width", "0.5");
+            path.setAttribute("stroke-dasharray", "5 3");
+            path.setAttribute("stroke-opacity", "0.5");
+        }
+
+        const arrow = srcIsLeft ? "→" : "↩";
+        const suffix = srcIsLeft ? "" : " (backward)";
+        const label = `${link.source} ${arrow} ${link.target}: ${link.value.toLocaleString()}${suffix}`;
+        path.style.cursor = "default";
+        path.addEventListener("mouseenter", (e) => {
+            path.style.opacity = "0.8";
+            this.showTooltip(e as MouseEvent, label);
+        });
+        path.addEventListener("mouseleave", () => { path.style.opacity = ""; this.hideTooltip(); });
+        this.linkLayer!.appendChild(path);
+
+        const opacity = srcIsLeft ? this.LINK_OPACITY : 0.32;
+        if (srcIsLeft) {
+            // Flow left→right: arrows along normal Bezier direction
+            this.drawPathArrows(x1, y1, cpx1, cpy1, cpx2, cpy2, x2, y2, tgt.color, opacity, false);
+        } else {
+            // Flow right→left: swap p0↔p3 and p1↔p2 so tangents (and arrows) point leftward
+            this.drawPathArrows(x2, y2, cpx2, cpy2, cpx1, cpy1, x1, y1, src.color, opacity, true);
+        }
+        void idx;
+    }
+
+    // ── Bezier math for arrowhead placement ────────────────────────────────────
+
+    private bezierPt(
+        p0x: number, p0y: number, p1x: number, p1y: number,
+        p2x: number, p2y: number, p3x: number, p3y: number, t: number
+    ): { x: number; y: number; angle: number } {
+        const mt = 1 - t;
+        const x = mt*mt*mt*p0x + 3*mt*mt*t*p1x + 3*mt*t*t*p2x + t*t*t*p3x;
+        const y = mt*mt*mt*p0y + 3*mt*mt*t*p1y + 3*mt*t*t*p2y + t*t*t*p3y;
+        // Tangent direction
+        const dx = 3*mt*mt*(p1x-p0x) + 6*mt*t*(p2x-p1x) + 3*t*t*(p3x-p2x);
+        const dy = 3*mt*mt*(p1y-p0y) + 6*mt*t*(p2y-p1y) + 3*t*t*(p3y-p2y);
+        return { x, y, angle: Math.atan2(dy, dx) * 180 / Math.PI };
+    }
+
+    private drawPathArrows(
+        p0x: number, p0y: number, p1x: number, p1y: number,
+        p2x: number, p2y: number, p3x: number, p3y: number,
+        color: string, opacity: number, isBackward: boolean
+    ) {
+        // Place 2 arrowheads at t=0.35 and t=0.65
+        const positions = isBackward ? [0.35, 0.65] : [0.33, 0.66];
+        const arrowOpacity = Math.min(1, opacity * 2.4);
+        const s = this.ARROW_SIZE;
+
+        for (const t of positions) {
+            const { x, y, angle } = this.bezierPt(p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y, t);
+
+            // Skip arrows that land outside the SVG
+            if (x < 0 || x > this.vpW || y < 0 || y > this.vpH) continue;
+
+            const arrow = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+            // Triangle pointing right, centered at origin, then rotated + translated
+            arrow.setAttribute("points", `${-s},${-s * 0.55} ${s},0 ${-s},${s * 0.55}`);
+            arrow.setAttribute("fill", color);
+            arrow.setAttribute("fill-opacity", String(arrowOpacity));
+            arrow.setAttribute("transform", `translate(${x.toFixed(1)},${y.toFixed(1)}) rotate(${angle.toFixed(1)})`);
+            arrow.style.pointerEvents = "none";
+            this.linkLayer!.appendChild(arrow);
+        }
+    }
+
+    // ── Node rendering ─────────────────────────────────────────────────────────
 
     private renderNodes(layer: SVGGElement) {
         this.nodes.forEach(node => layer.appendChild(this.buildNodeGroup(node)));
@@ -385,56 +716,70 @@ export class Visual implements IVisual {
     private buildNodeGroup(node: SankeyNode): SVGGElement {
         const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
 
-        // ── Body rectangle ─────────────────────────────────────────────────────
+        // [0] Body rect
         const rect = this.svgRect(node.x, node.y, node.w, node.h, node.color, 3);
         rect.style.cursor = "grab";
         rect.addEventListener("mouseenter", (e) => {
             rect.setAttribute("fill-opacity", "0.75");
             this.showTooltip(e as MouseEvent, `${node.label}  |  ${node.value.toLocaleString()}`);
         });
-        rect.addEventListener("mouseleave", () => {
-            rect.removeAttribute("fill-opacity");
-            this.hideTooltip();
-        });
-        g.appendChild(rect); // child[0]
+        rect.addEventListener("mouseleave", () => { rect.removeAttribute("fill-opacity"); this.hideTooltip(); });
+        g.appendChild(rect);
 
-        // ── Label ─────────────────────────────────────────────────────────────
+        // [1] Label text — clipped to stay within SVG
+        const maxCol = this.numColumns - 1;
+        const isLastCol = node.colIndex === maxCol;
         const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-        const maxCol = Math.max(0, ...Array.from(this.nodes.values()).map(n => n.column));
-        text.setAttribute("y", String(node.y + node.h / 2));
+        text.setAttribute("y", String(node.y + node.h / 2 - 15));
         text.setAttribute("dominant-baseline", "middle");
         text.setAttribute("font-size", "11");
         text.setAttribute("font-family", "Segoe UI, sans-serif");
         text.setAttribute("fill", "#222");
         text.style.pointerEvents = "none";
         text.style.userSelect = "none";
-        if (node.column === maxCol) {
-            text.setAttribute("x", String(node.x - 4));
+        if (isLastCol) {
+            const lx = Math.max(4, node.x - 4);
+            text.setAttribute("x", String(lx));
             text.setAttribute("text-anchor", "end");
         } else {
-            text.setAttribute("x", String(node.x + node.w + 4));
+            const lx = Math.min(this.vpW - 4, node.x + node.w + 4);
+            text.setAttribute("x", String(lx));
             text.setAttribute("text-anchor", "start");
         }
         text.textContent = node.label;
-        g.appendChild(text); // child[1]
+        g.appendChild(text);
 
-        // ── Corner resize handles ─────────────────────────────────────────────
-        const hs = this.HANDLE;
-        for (const { dx, dy, cur, corner } of [
-            { dx: 0, dy: 0, cur: "nw-resize", corner: "nw" },
-            { dx: 1, dy: 0, cur: "ne-resize", corner: "ne" },
-            { dx: 0, dy: 1, cur: "sw-resize", corner: "sw" },
-            { dx: 1, dy: 1, cur: "se-resize", corner: "se" },
-        ]) {
-            const h = this.svgRect(node.x + node.w * dx - hs/2, node.y + node.h * dy - hs/2, hs, hs, "#ffffff", 2);
-            h.setAttribute("stroke", node.color);
-            h.setAttribute("stroke-width", "1.5");
-            h.style.cursor = cur;
-            this.attachResizeHandler(h, g, node, corner);
-            g.appendChild(h); // child[2..5]
-        }
+        // [2] Inflow stat  [3] Outflow stat  [4] Self-loop stat
+        const statX = isLastCol ? Math.max(4, node.x - 4) : Math.min(this.vpW - 4, node.x + node.w + 4);
+        const anchor = isLastCol ? "end" : "start";
+        const makeStatText = (yOff: number, content: string): SVGTextElement => {
+            const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            t.setAttribute("x", String(statX));
+            t.setAttribute("y", String(node.y + node.h / 2 + yOff));
+            t.setAttribute("dominant-baseline", "middle");
+            t.setAttribute("font-size", "9");
+            t.setAttribute("font-family", "Segoe UI, sans-serif");
+            t.setAttribute("fill", "#666");
+            t.setAttribute("text-anchor", anchor);
+            t.style.pointerEvents = "none";
+            t.style.userSelect = "none";
+            t.textContent = content;
+            return t;
+        };
+        g.appendChild(makeStatText(-3,  `↓ ${node.inflow.toLocaleString()}`));
+        g.appendChild(makeStatText(+8,  `↑ ${node.outflow.toLocaleString()}`));
+        g.appendChild(makeStatText(+19, node.selfLoop > 0 ? `↺ ${node.selfLoop.toLocaleString()}` : ""));
 
-        // Drag must be attached after handles so handles can stopPropagation
+        // [5] Left edge resize handle (invisible 8px strip, ew-resize cursor)
+        const leftHandle = this.makeEdgeHandle(node.x - 4, node.y, node.h);
+        this.attachWidthResizeHandler(leftHandle, g, node);
+        g.appendChild(leftHandle);
+
+        // [6] Right edge resize handle
+        const rightHandle = this.makeEdgeHandle(node.x + node.w - 4, node.y, node.h);
+        this.attachWidthResizeHandler(rightHandle, g, node);
+        g.appendChild(rightHandle);
+
         this.attachDragHandler(rect, g, node);
         return g;
     }
@@ -451,9 +796,8 @@ export class Visual implements IVisual {
 
     private attachDragHandler(rect: SVGRectElement, g: SVGGElement, node: SankeyNode) {
         rect.addEventListener("mousedown", (e) => {
-            if ((e.target as Element) !== rect) return; // let handle events through
-            e.preventDefault();
-            e.stopPropagation();
+            if ((e.target as Element) !== rect) return;
+            e.preventDefault(); e.stopPropagation();
             this.hideTooltip();
 
             const sx = e.clientX, sy = e.clientY;
@@ -465,9 +809,17 @@ export class Visual implements IVisual {
                 node.y = oy + (ev.clientY - sy);
                 this.syncNodeDOM(g, node);
                 this.renderLinks();
+                this.refreshSelfLoops();
             };
             const onUp = () => {
                 rect.style.cursor = "grab";
+                // Snap to nearest column and clamp to viewport
+                node.colIndex = this.nearestColIndex(node.x, node.w);
+                node.x = this.colX(node.colIndex) - node.w / 2;
+                node.x = Math.max(this.PAD.l - node.w / 2, Math.min(this.vpW - this.PAD.r - node.w / 2, node.x));
+                node.y = Math.max(this.PAD.t, Math.min(this.vpH - this.PAD.b - node.h, node.y));
+                this.syncNodeDOM(g, node);
+                this.renderLinks();
                 this.persistPositions();
                 document.removeEventListener("mousemove", onMove);
                 document.removeEventListener("mouseup", onUp);
@@ -477,38 +829,38 @@ export class Visual implements IVisual {
         });
     }
 
-    // ── Resize ─────────────────────────────────────────────────────────────────
+    private makeEdgeHandle(x: number, y: number, h: number): SVGRectElement {
+        const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        r.setAttribute("x", String(x));
+        r.setAttribute("y", String(y));
+        r.setAttribute("width", "8");
+        r.setAttribute("height", String(h));
+        r.setAttribute("fill", "transparent");
+        r.style.cursor = "ew-resize";
+        r.addEventListener("mouseenter", () => r.setAttribute("fill", "rgba(0,0,0,0.10)"));
+        r.addEventListener("mouseleave", () => r.setAttribute("fill", "transparent"));
+        return r;
+    }
 
-    private attachResizeHandler(handle: SVGRectElement, g: SVGGElement, node: SankeyNode, corner: string) {
+    private attachWidthResizeHandler(handle: SVGRectElement, g: SVGGElement, node: SankeyNode) {
         handle.addEventListener("mousedown", (e) => {
             e.preventDefault();
             e.stopPropagation();
             this.hideTooltip();
 
-            const sx = e.clientX, sy = e.clientY;
-            const ox = node.x, oy = node.y, ow = node.w, oh = node.h;
+            // Center stays fixed; both edges expand/contract symmetrically
+            const centerX = node.x + node.w / 2;
+            const MIN_HALF_W = 6;
 
             const onMove = (ev: MouseEvent) => {
-                const dx = ev.clientX - sx;
-                const dy = ev.clientY - sy;
-
-                if (corner.includes("e")) {
-                    node.w = Math.max(this.NODE_MIN_W, ow + dx);
-                } else {
-                    const nw = Math.max(this.NODE_MIN_W, ow - dx);
-                    node.x = ox + ow - nw;
-                    node.w = nw;
-                }
-                if (corner.includes("s")) {
-                    node.h = Math.max(this.NODE_MIN_H, oh + dy);
-                } else {
-                    const nh = Math.max(this.NODE_MIN_H, oh - dy);
-                    node.y = oy + oh - nh;
-                    node.h = nh;
-                }
-
+                const svgBounds = this.svg.getBoundingClientRect();
+                const mouseX = ev.clientX - svgBounds.left;
+                const halfW = Math.max(MIN_HALF_W, Math.abs(mouseX - centerX));
+                node.w = halfW * 2;
+                node.x = centerX - halfW;
                 this.syncNodeDOM(g, node);
                 this.renderLinks();
+                this.refreshSelfLoops();
             };
             const onUp = () => {
                 this.persistPositions();
@@ -520,11 +872,12 @@ export class Visual implements IVisual {
         });
     }
 
-    // ── DOM sync (update existing elements without full re-render) ─────────────
+    // ── DOM sync ───────────────────────────────────────────────────────────────
 
     private syncNodeDOM(g: SVGGElement, node: SankeyNode) {
         const ch = g.children;
-        const hs = this.HANDLE;
+        const isLastCol = node.colIndex === (this.numColumns - 1);
+        const tx = isLastCol ? Math.max(4, node.x - 4) : Math.min(this.vpW - 4, node.x + node.w + 4);
 
         // [0] body rect
         const rect = ch[0] as SVGRectElement;
@@ -533,28 +886,38 @@ export class Visual implements IVisual {
         rect.setAttribute("width", String(node.w));
         rect.setAttribute("height", String(node.h));
 
-        // [1] label text
-        const text = ch[1] as SVGTextElement;
-        if (text?.tagName === "text") {
-            const maxCol = Math.max(0, ...Array.from(this.nodes.values()).map(n => n.column));
-            text.setAttribute("y", String(node.y + node.h / 2));
-            if (node.column === maxCol) {
-                text.setAttribute("x", String(node.x - 4));
-            } else {
-                text.setAttribute("x", String(node.x + node.w + 4));
+        // [1] label
+        const lbl = ch[1] as SVGTextElement;
+        if (lbl?.tagName === "text") {
+            lbl.setAttribute("y", String(node.y + node.h / 2 - 15));
+            lbl.setAttribute("x", String(tx));
+        }
+
+        // [2] inflow  [3] outflow  [4] self-loop
+        const yMid = node.y + node.h / 2;
+        const offsets = [-3, 8, 19];
+        for (let i = 0; i < 3; i++) {
+            const el = ch[2 + i] as SVGTextElement;
+            if (el?.tagName === "text") {
+                el.setAttribute("x", String(tx));
+                el.setAttribute("y", String(yMid + offsets[i]));
             }
         }
 
-        // [2..5] corner handles
-        for (const [i, { dx, dy }] of [
-            { dx: 0, dy: 0 }, { dx: 1, dy: 0 },
-            { dx: 0, dy: 1 }, { dx: 1, dy: 1 }
-        ].entries()) {
-            const h = ch[2 + i] as SVGRectElement;
-            if (h) {
-                h.setAttribute("x", String(node.x + node.w * dx - hs/2));
-                h.setAttribute("y", String(node.y + node.h * dy - hs/2));
-            }
+        // [5] left edge handle
+        const leftH = ch[5] as SVGRectElement;
+        if (leftH) {
+            leftH.setAttribute("x", String(node.x - 4));
+            leftH.setAttribute("y", String(node.y));
+            leftH.setAttribute("height", String(node.h));
+        }
+
+        // [6] right edge handle
+        const rightH = ch[6] as SVGRectElement;
+        if (rightH) {
+            rightH.setAttribute("x", String(node.x + node.w - 4));
+            rightH.setAttribute("y", String(node.y));
+            rightH.setAttribute("height", String(node.h));
         }
     }
 
@@ -562,11 +925,9 @@ export class Visual implements IVisual {
 
     private persistPositions() {
         const pos: Record<string, NodePosition> = {};
-        // Keep positions of all nodes ever seen (including filtered-out ones)
         this.savedPositions.forEach((p, id) => { pos[id] = p; });
-        // Overwrite with current node positions (drag/resize may have updated them)
         this.nodes.forEach((node, id) => {
-            pos[id] = { x: node.x, y: node.y, w: node.w, h: node.h };
+            pos[id] = { colIndex: node.colIndex, y: node.y, w: node.w };
         });
         this.savedPositions = new Map(Object.entries(pos));
 
@@ -579,17 +940,24 @@ export class Visual implements IVisual {
         });
     }
 
+    private persistColumnCount() {
+        this.host.persistProperties({
+            merge: [{
+                objectName: "columnCount",
+                properties: { count: this.numColumns },
+                selector: null
+            }]
+        });
+    }
+
     // ── Utility ────────────────────────────────────────────────────────────────
 
     private showMessage(msg: string) {
         while (this.svg.firstChild) this.svg.removeChild(this.svg.firstChild);
         const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-        text.setAttribute("x", "50%");
-        text.setAttribute("y", "50%");
-        text.setAttribute("text-anchor", "middle");
-        text.setAttribute("dominant-baseline", "middle");
-        text.setAttribute("font-size", "14");
-        text.setAttribute("font-family", "Segoe UI, sans-serif");
+        text.setAttribute("x", "50%"); text.setAttribute("y", "50%");
+        text.setAttribute("text-anchor", "middle"); text.setAttribute("dominant-baseline", "middle");
+        text.setAttribute("font-size", "14"); text.setAttribute("font-family", "Segoe UI, sans-serif");
         text.setAttribute("fill", "#888");
         text.textContent = msg;
         this.svg.appendChild(text);
@@ -602,7 +970,5 @@ export class Visual implements IVisual {
         this.tooltip.style.top  = `${e.clientY - 34}px`;
     }
 
-    private hideTooltip() {
-        this.tooltip.style.display = "none";
-    }
+    private hideTooltip() { this.tooltip.style.display = "none"; }
 }

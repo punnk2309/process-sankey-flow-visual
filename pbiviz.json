@@ -4,7 +4,7 @@
     "displayName": "Multi-Level Sankey",
     "guid": "multiLevelSankeyA1B2C3D4E5F6G7H8",
     "visualClassName": "Visual",
-    "version": "1.0.0.0",
+    "version": "1.1.0.0",
     "description": "A multi-level Sankey diagram with backward flow support and customizable column layout.",
     "supportUrl": "https://github.com",
     "gitHubUrl": ""

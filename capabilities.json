@@ -55,6 +55,20 @@
           "type": { "text": true }
         }
       }
+    },
+    "columnCount": {
+      "properties": {
+        "count": {
+          "type": { "numeric": true }
+        }
+      }
+    },
+    "linkJoints": {
+      "properties": {
+        "joints": {
+          "type": { "text": true }
+        }
+      }
     }
   },
   "supportsHighlight": true,
