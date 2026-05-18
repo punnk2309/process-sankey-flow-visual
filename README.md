@@ -1,4 +1,4 @@
-# nestle-sankey-visual
+# Process Sankey Flow Visual
 
 Custom Power BI visual — multi-level Sankey diagram with full interaction support.  
 Built with TypeScript + vanilla SVG (no D3). Packaged via `powerbi-visuals-tools` v5.6.0.

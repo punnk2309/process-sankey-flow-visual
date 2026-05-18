@@ -5,3 +5,4 @@ npm-debug.log*
 Thumbs.db
 webpack.statistics.prod.html
 InstructionsFrom14-5-26
+.claude/
