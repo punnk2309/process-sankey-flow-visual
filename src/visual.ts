@@ -37,7 +37,6 @@ interface SankeyLink {
     target: string;
     value: number;
     isBackward?: boolean;
-    selectionId?: powerbi.visuals.ISelectionId;
 }
 
 export class Visual implements IVisual {
@@ -52,7 +51,9 @@ export class Visual implements IVisual {
     private defs: SVGDefsElement | null = null;
     private linkLayer: SVGGElement | null = null;
 
-    private selectionManager: powerbi.extensibility.ISelectionManager;
+    private panel: HTMLDivElement;
+    private panelX: number = -1;
+    private panelY: number = -1;
     private nodeRects: Map<string, SVGRectElement> = new Map();
     private selectedNodeId: string | null = null;
 
@@ -80,7 +81,6 @@ export class Visual implements IVisual {
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
-        this.selectionManager = options.host.createSelectionManager();
 
         this.container = document.createElement("div");
         this.container.style.cssText = [
@@ -101,6 +101,15 @@ export class Visual implements IVisual {
             "z-index:9999","display:none","min-width:180px"
         ].join(";");
         document.body.appendChild(this.tooltip);
+
+        this.panel = document.createElement("div");
+        this.panel.style.cssText = [
+            "position:fixed","background:rgba(18,18,28,0.95)","color:#fff",
+            "border-radius:6px","font-size:12px","font-family:Segoe UI,sans-serif",
+            "z-index:9998","display:none","min-width:220px",
+            "box-shadow:0 4px 24px rgba(0,0,0,0.5)"
+        ].join(";");
+        document.body.appendChild(this.panel);
     }
 
     public update(options: VisualUpdateOptions) {
@@ -188,7 +197,7 @@ export class Visual implements IVisual {
         const nodes = new Map<string, SankeyNode>();
         const links: SankeyLink[] = [];
 
-        rows.forEach((row, rowIndex) => {
+        rows.forEach((row) => {
             const source = String(row[si] ?? "").trim();
             const target = String(row[ti] ?? "").trim();
             const value  = parseFloat(String(row[vi] ?? "0")) || 0;
@@ -196,11 +205,7 @@ export class Visual implements IVisual {
 
             if (!nodes.has(source)) nodes.set(source, this.newNode(source));
             if (!nodes.has(target)) nodes.set(target, this.newNode(target));
-            const selectionId = this.host
-                .createSelectionIdBuilder()
-                .withTable(dataView.table!, rowIndex)
-                .createSelectionId();
-            links.push({ source, target, value, selectionId });
+            links.push({ source, target, value });
         });
 
         return { nodes, links };
@@ -404,8 +409,8 @@ export class Visual implements IVisual {
 
         this.svg.addEventListener("click", (e) => {
             if (e.target === this.svg && this.selectedNodeId) {
-                this.selectionManager.clear();
                 this.selectedNodeId = null;
+                this.panel.style.display = "none";
                 this.nodeRects.forEach(r => { r.removeAttribute("stroke"); r.removeAttribute("stroke-width"); });
             }
         });
@@ -573,62 +578,94 @@ export class Visual implements IVisual {
         while (this.linkLayer.firstChild) this.linkLayer.removeChild(this.linkLayer.firstChild);
         while (this.defs.firstChild) this.defs.removeChild(this.defs.firstChild);
 
-        // Routing is purely colIndex-based:
-        //   left node (smaller colIndex) → right-edge exit
-        //   right node (larger colIndex) → left-edge entry
-        // All connections between the same pair share the same two offset pools,
-        // so bidirectional flows stack together instead of splitting across sides.
-        const rightOff = new Map<string, number>(); // right-edge exits (node is left of partner)
-        const leftOff  = new Map<string, number>(); // left-edge entries (node is right of partner)
-        this.nodes.forEach((_, id) => { rightOff.set(id, 0); leftOff.set(id, 0); });
+        const activeLinks = [...this.links].filter(l => l.source !== l.target);
 
-        // Self-loops are rendered separately above nodes — exclude from offset pools
-        const sorted = [...this.links]
-            .filter(l => l.source !== l.target)
-            .sort((a, b) => (a.isBackward ? 1 : 0) - (b.isBackward ? 1 : 0));
+        // Group links by which node's edge they attach to so we can sort each
+        // group by the Y-center of the other end — this minimises ribbon crossings
+        // whenever the user reorders nodes vertically.
+        const rightEdgeLinks = new Map<string, SankeyLink[]>(); // leftNode.id → links
+        const leftEdgeLinks  = new Map<string, SankeyLink[]>(); // rightNode.id → links
+        this.nodes.forEach((_, id) => { rightEdgeLinks.set(id, []); leftEdgeLinks.set(id, []); });
 
-        sorted.forEach((link, i) => {
+        activeLinks.forEach(link => {
             const src = this.nodes.get(link.source);
             const tgt = this.nodes.get(link.target);
             if (!src || !tgt) return;
-
-            const thick = Math.max(2, this.scaleF * link.value);
-            const halfT = thick / 2;
-
-            // Determine which node is visually to the left based on current snap column
-            const srcIsLeft = src.colIndex <= tgt.colIndex;
-            const leftNode  = srcIsLeft ? src : tgt;
-            const rightNode = srcIsLeft ? tgt : src;
-
-            // Always route: right edge of left node → left edge of right node
-            const ro = rightOff.get(leftNode.id) || 0;
-            const lo = leftOff.get(rightNode.id) || 0;
-            const x1 = leftNode.x + leftNode.w;  const y1 = leftNode.y + ro + halfT;
-            const x2 = rightNode.x;               const y2 = rightNode.y + lo + halfT;
-            rightOff.set(leftNode.id, ro + thick);
-            leftOff.set(rightNode.id, lo + thick);
-
-            // Gradient: left-node color → right-node color (matches visual ribbon position)
-            const gradId = `g${i}`;
-            const grad = document.createElementNS("http://www.w3.org/2000/svg", "linearGradient");
-            grad.setAttribute("id", gradId);
-            grad.setAttribute("gradientUnits", "userSpaceOnUse");
-            grad.setAttribute("x1", String(x1)); grad.setAttribute("y1", String(y1));
-            grad.setAttribute("x2", String(x2)); grad.setAttribute("y2", String(y2));
-            // Flow goes right-to-left when !srcIsLeft, so swap stop colors
-            const c0 = leftNode.color, c1 = rightNode.color;
-            const opacity = srcIsLeft ? this.LINK_OPACITY : 0.32;
-            for (const [off, color] of [[0, c0], [1, c1]] as [number, string][]) {
-                const stop = document.createElementNS("http://www.w3.org/2000/svg", "stop");
-                stop.setAttribute("offset", String(off));
-                stop.setAttribute("stop-color", color);
-                stop.setAttribute("stop-opacity", String(opacity));
-                grad.appendChild(stop);
-            }
-            this.defs.appendChild(grad);
-
-            this.drawLink(link, src, tgt, x1, y1, x2, y2, halfT, gradId, srcIsLeft, i);
+            const leftNode  = src.colIndex <= tgt.colIndex ? src : tgt;
+            const rightNode = src.colIndex <= tgt.colIndex ? tgt : src;
+            rightEdgeLinks.get(leftNode.id)?.push(link);
+            leftEdgeLinks.get(rightNode.id)?.push(link);
         });
+
+        // Sort each edge's links by Y-center of the connected node on the other side
+        const yCtr = (n: SankeyNode) => n.y + n.h / 2;
+        const otherNode = (link: SankeyLink, nodeId: string): SankeyNode =>
+            this.nodes.get(link.source === nodeId ? link.target : link.source)!;
+        rightEdgeLinks.forEach((links, id) =>
+            links.sort((a, b) => yCtr(otherNode(a, id)) - yCtr(otherNode(b, id))));
+        leftEdgeLinks.forEach((links, id) =>
+            links.sort((a, b) => yCtr(otherNode(a, id)) - yCtr(otherNode(b, id))));
+
+        // Pre-compute the Y attachment point for each link on both ends
+        const linkY1 = new Map<SankeyLink, number>(); // right-edge of leftNode
+        const linkY2 = new Map<SankeyLink, number>(); // left-edge of rightNode
+        rightEdgeLinks.forEach((links, id) => {
+            const node = this.nodes.get(id)!;
+            let off = 0;
+            links.forEach(link => {
+                const thick = Math.max(2, this.scaleF * link.value);
+                linkY1.set(link, node.y + off + thick / 2);
+                off += thick;
+            });
+        });
+        leftEdgeLinks.forEach((links, id) => {
+            const node = this.nodes.get(id)!;
+            let off = 0;
+            links.forEach(link => {
+                const thick = Math.max(2, this.scaleF * link.value);
+                linkY2.set(link, node.y + off + thick / 2);
+                off += thick;
+            });
+        });
+
+        // Draw links — forward flows first for consistent layering
+        activeLinks
+            .sort((a, b) => (a.isBackward ? 1 : 0) - (b.isBackward ? 1 : 0))
+            .forEach((link, i) => {
+                const src = this.nodes.get(link.source);
+                const tgt = this.nodes.get(link.target);
+                if (!src || !tgt) return;
+
+                const thick = Math.max(2, this.scaleF * link.value);
+                const halfT = thick / 2;
+                const srcIsLeft = src.colIndex <= tgt.colIndex;
+                const leftNode  = srcIsLeft ? src : tgt;
+                const rightNode = srcIsLeft ? tgt : src;
+
+                const x1 = leftNode.x + leftNode.w;
+                const x2 = rightNode.x;
+                const y1 = linkY1.get(link) ?? (leftNode.y + halfT);
+                const y2 = linkY2.get(link) ?? (rightNode.y + halfT);
+
+                const gradId = `g${i}`;
+                const grad = document.createElementNS("http://www.w3.org/2000/svg", "linearGradient");
+                grad.setAttribute("id", gradId);
+                grad.setAttribute("gradientUnits", "userSpaceOnUse");
+                grad.setAttribute("x1", String(x1)); grad.setAttribute("y1", String(y1));
+                grad.setAttribute("x2", String(x2)); grad.setAttribute("y2", String(y2));
+                const c0 = leftNode.color, c1 = rightNode.color;
+                const opacity = srcIsLeft ? this.LINK_OPACITY : 0.32;
+                for (const [off, color] of [[0, c0], [1, c1]] as [number, string][]) {
+                    const stop = document.createElementNS("http://www.w3.org/2000/svg", "stop");
+                    stop.setAttribute("offset", String(off));
+                    stop.setAttribute("stop-color", color);
+                    stop.setAttribute("stop-opacity", String(opacity));
+                    grad.appendChild(stop);
+                }
+                this.defs.appendChild(grad);
+
+                this.drawLink(link, src, tgt, x1, y1, x2, y2, halfT, gradId, srcIsLeft, i);
+            });
     }
 
     private drawLink(
@@ -849,7 +886,7 @@ export class Visual implements IVisual {
                 this.persistPositions();
                 document.removeEventListener("mousemove", onMove);
                 document.removeEventListener("mouseup", onUp);
-                if (!hasMoved) this.handleNodeClick(node.id);
+                if (!hasMoved) this.handleNodeClick(node.id, e);
             };
             document.addEventListener("mousemove", onMove);
             document.addEventListener("mouseup", onUp);
@@ -990,59 +1027,128 @@ export class Visual implements IVisual {
         this.svg.appendChild(text);
     }
 
-    private handleNodeClick(nodeId: string) {
-        if (this.selectedNodeId === nodeId) {
-            this.selectionManager.clear();
+    private handleNodeClick(nodeId: string, e: MouseEvent) {
+        const clearSelection = () => {
             this.selectedNodeId = null;
-        } else {
-            const ids = this.links
-                .filter(l => l.source === nodeId || l.target === nodeId)
-                .map(l => l.selectionId!)
-                .filter(Boolean);
-            this.selectionManager.select(ids);
-            this.selectedNodeId = nodeId;
+            this.panel.style.display = "none";
+            this.nodeRects.forEach(r => { r.removeAttribute("stroke"); r.removeAttribute("stroke-width"); });
+        };
+
+        if (this.selectedNodeId === nodeId) { clearSelection(); return; }
+
+        const wasHidden = this.panel.style.display === "none";
+        this.selectedNodeId = nodeId;
+        const node = this.nodes.get(nodeId)!;
+
+        // Clear and rebuild panel DOM
+        while (this.panel.firstChild) this.panel.removeChild(this.panel.firstChild);
+
+        const header = document.createElement("div");
+        header.style.cssText = "cursor:move;padding:8px 12px;border-bottom:1px solid rgba(255,255,255,0.15);display:flex;justify-content:space-between;align-items:center;font-weight:600;border-radius:6px 6px 0 0";
+        const titleSpan = document.createElement("span");
+        titleSpan.textContent = node.label;
+        const closeBtn = document.createElement("span");
+        closeBtn.textContent = "×";
+        closeBtn.style.cssText = "cursor:pointer;opacity:0.55;padding-left:14px;font-size:16px;line-height:1";
+        closeBtn.addEventListener("click", clearSelection);
+        header.appendChild(titleSpan);
+        header.appendChild(closeBtn);
+        this.panel.appendChild(header);
+
+        const body = document.createElement("div");
+        body.style.cssText = "padding:8px 12px";
+        body.appendChild(this.buildFromToTable(nodeId, "panel"));
+        this.panel.appendChild(body);
+
+        if (wasHidden) {
+            this.panelX = Math.min(e.clientX + 24, window.innerWidth - 260);
+            this.panelY = Math.max(16, e.clientY - 20);
         }
+        this.panel.style.left = `${this.panelX}px`;
+        this.panel.style.top  = `${this.panelY}px`;
+        this.panel.style.display = "block";
+
+        header.addEventListener("mousedown", (md) => {
+            if (md.target === closeBtn) return;
+            md.preventDefault();
+            const ox = this.panelX - md.clientX, oy = this.panelY - md.clientY;
+            const onMove = (mv: MouseEvent) => {
+                this.panelX = mv.clientX + ox;
+                this.panelY = mv.clientY + oy;
+                this.panel.style.left = `${this.panelX}px`;
+                this.panel.style.top  = `${this.panelY}px`;
+            };
+            const onUp = () => { document.removeEventListener("mousemove", onMove); document.removeEventListener("mouseup", onUp); };
+            document.addEventListener("mousemove", onMove);
+            document.addEventListener("mouseup", onUp);
+        });
+
         this.nodeRects.forEach((r, id) => {
-            if (id === this.selectedNodeId) {
-                r.setAttribute("stroke", "#1565C0");
-                r.setAttribute("stroke-width", "2.5");
-            } else {
-                r.removeAttribute("stroke");
-                r.removeAttribute("stroke-width");
-            }
+            if (id === this.selectedNodeId) { r.setAttribute("stroke", "#fff"); r.setAttribute("stroke-width", "2"); }
+            else { r.removeAttribute("stroke"); r.removeAttribute("stroke-width"); }
         });
     }
 
-    private showNodeTooltip(e: MouseEvent, node: SankeyNode) {
-        const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        const incoming = this.links.filter(l => l.target === node.id && l.source !== node.id);
-        const outgoing = this.links.filter(l => l.source === node.id && l.target !== node.id);
+    private buildFromToTable(nodeId: string, variant: "panel" | "tooltip"): HTMLTableElement {
+        const isPnl = variant === "panel";
+        const incoming = this.links.filter(l => l.target === nodeId && l.source !== nodeId);
+        const outgoing = this.links.filter(l => l.source === nodeId && l.target !== nodeId);
         const maxRows = Math.max(incoming.length, outgoing.length, 1);
 
-        let html = `<div style="font-weight:600;text-align:center;margin-bottom:6px;padding-bottom:5px;border-bottom:1px solid rgba(255,255,255,0.25)">${esc(node.label)}</div>`;
-        html += `<table style="border-collapse:collapse;width:100%">`;
-        html += `<tr>`;
-        html += `<th style="text-align:left;padding:0 14px 4px 0;opacity:0.65;font-weight:600;font-size:11px;letter-spacing:.04em">FROM</th>`;
-        html += `<th style="text-align:left;padding:0 0 4px 0;opacity:0.65;font-weight:600;font-size:11px;letter-spacing:.04em">TO</th>`;
-        html += `</tr>`;
+        const table = document.createElement("table");
+        table.style.cssText = "border-collapse:collapse;width:100%";
 
-        for (let i = 0; i < maxRows; i++) {
-            const fromLink = incoming[i];
-            const toLink   = outgoing[i];
-            const fromCell = fromLink
-                ? `<span style="opacity:0.85">${esc(fromLink.source)}</span>&nbsp;<span style="opacity:0.5">→</span>&nbsp;<strong>${fromLink.value.toLocaleString()}</strong>`
-                : `<span style="opacity:0.25">—</span>`;
-            const toCell = toLink
-                ? `<span style="opacity:0.85">${esc(toLink.target)}</span>&nbsp;<span style="opacity:0.5">→</span>&nbsp;<strong>${toLink.value.toLocaleString()}</strong>`
-                : `<span style="opacity:0.25">—</span>`;
-            html += `<tr>`;
-            html += `<td style="padding:2px 14px 2px 0;white-space:nowrap">${fromCell}</td>`;
-            html += `<td style="padding:2px 0;white-space:nowrap">${toCell}</td>`;
-            html += `</tr>`;
+        const hRow = document.createElement("tr");
+        for (const label of ["FROM", "TO"]) {
+            const th = document.createElement("th");
+            th.textContent = label;
+            th.style.cssText = isPnl
+                ? `text-align:left;padding:0 ${label === "FROM" ? "14px" : "0"} 5px 0;opacity:0.55;font-weight:600;font-size:10px;letter-spacing:.08em`
+                : `text-align:left;padding:0 ${label === "FROM" ? "14px" : "0"} 4px 0;opacity:0.65;font-weight:600;font-size:11px;letter-spacing:.04em`;
+            hRow.appendChild(th);
         }
+        table.appendChild(hRow);
 
-        html += `</table>`;
-        this.tooltip.innerHTML = html;
+        const flowCell = (name: string | undefined, val: number | undefined, tdCss: string): HTMLTableCellElement => {
+            const td = document.createElement("td");
+            td.style.cssText = tdCss;
+            if (name !== undefined) {
+                td.appendChild(document.createTextNode(name + " "));
+                const arr = document.createElement("span");
+                arr.style.opacity = isPnl ? "0.4" : "0.5";
+                arr.textContent = "→";
+                td.appendChild(arr);
+                const b = document.createElement("b");
+                b.textContent = " " + val!.toLocaleString();
+                td.appendChild(b);
+            } else {
+                const d = document.createElement("span");
+                d.style.opacity = "0.25";
+                d.textContent = "—";
+                td.appendChild(d);
+            }
+            return td;
+        };
+
+        const pad = isPnl ? "3px" : "2px";
+        for (let i = 0; i < maxRows; i++) {
+            const tr = document.createElement("tr");
+            tr.appendChild(flowCell(incoming[i]?.source, incoming[i]?.value, `padding:${pad} 14px ${pad} 0;white-space:nowrap`));
+            tr.appendChild(flowCell(outgoing[i]?.target, outgoing[i]?.value, `padding:${pad} 0;white-space:nowrap`));
+            table.appendChild(tr);
+        }
+        return table;
+    }
+
+    private showNodeTooltip(e: MouseEvent, node: SankeyNode) {
+        while (this.tooltip.firstChild) this.tooltip.removeChild(this.tooltip.firstChild);
+
+        const header = document.createElement("div");
+        header.style.cssText = "font-weight:600;text-align:center;margin-bottom:6px;padding-bottom:5px;border-bottom:1px solid rgba(255,255,255,0.25)";
+        header.textContent = node.label;
+        this.tooltip.appendChild(header);
+        this.tooltip.appendChild(this.buildFromToTable(node.id, "tooltip"));
+
         this.tooltip.style.display = "block";
         this.tooltip.style.left = `${e.clientX + 14}px`;
         this.tooltip.style.top  = `${e.clientY - 34}px`;
