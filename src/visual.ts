@@ -37,6 +37,7 @@ interface SankeyLink {
     target: string;
     value: number;
     isBackward?: boolean;
+    selectionId?: powerbi.visuals.ISelectionId;
 }
 
 export class Visual implements IVisual {
@@ -50,6 +51,10 @@ export class Visual implements IVisual {
     private links: SankeyLink[] = [];
     private defs: SVGDefsElement | null = null;
     private linkLayer: SVGGElement | null = null;
+
+    private selectionManager: powerbi.extensibility.ISelectionManager;
+    private nodeRects: Map<string, SVGRectElement> = new Map();
+    private selectedNodeId: string | null = null;
 
     private colorMap: Map<string, string> = new Map();
     private colorIdx = 0;
@@ -75,6 +80,7 @@ export class Visual implements IVisual {
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
+        this.selectionManager = options.host.createSelectionManager();
 
         this.container = document.createElement("div");
         this.container.style.cssText = [
@@ -182,7 +188,7 @@ export class Visual implements IVisual {
         const nodes = new Map<string, SankeyNode>();
         const links: SankeyLink[] = [];
 
-        rows.forEach(row => {
+        rows.forEach((row, rowIndex) => {
             const source = String(row[si] ?? "").trim();
             const target = String(row[ti] ?? "").trim();
             const value  = parseFloat(String(row[vi] ?? "0")) || 0;
@@ -190,7 +196,11 @@ export class Visual implements IVisual {
 
             if (!nodes.has(source)) nodes.set(source, this.newNode(source));
             if (!nodes.has(target)) nodes.set(target, this.newNode(target));
-            links.push({ source, target, value });
+            const selectionId = this.host
+                .createSelectionIdBuilder()
+                .withTable(dataView.table!, rowIndex)
+                .createSelectionId();
+            links.push({ source, target, value, selectionId });
         });
 
         return { nodes, links };
@@ -391,6 +401,14 @@ export class Visual implements IVisual {
         this.renderLinks();
         this.renderNodes(nodeLayer);
         this.renderSelfLoops(selfLoopLayer);
+
+        this.svg.addEventListener("click", (e) => {
+            if (e.target === this.svg && this.selectedNodeId) {
+                this.selectionManager.clear();
+                this.selectedNodeId = null;
+                this.nodeRects.forEach(r => { r.removeAttribute("stroke"); r.removeAttribute("stroke-width"); });
+            }
+        });
     }
 
     private refreshSelfLoops() {
@@ -710,6 +728,7 @@ export class Visual implements IVisual {
     // ── Node rendering ─────────────────────────────────────────────────────────
 
     private renderNodes(layer: SVGGElement) {
+        this.nodeRects.clear();
         this.nodes.forEach(node => layer.appendChild(this.buildNodeGroup(node)));
     }
 
@@ -719,6 +738,11 @@ export class Visual implements IVisual {
         // [0] Body rect
         const rect = this.svgRect(node.x, node.y, node.w, node.h, node.color, 3);
         rect.style.cursor = "grab";
+        this.nodeRects.set(node.id, rect);
+        if (node.id === this.selectedNodeId) {
+            rect.setAttribute("stroke", "#1565C0");
+            rect.setAttribute("stroke-width", "2.5");
+        }
         rect.addEventListener("mouseenter", (e) => {
             rect.setAttribute("fill-opacity", "0.75");
             this.showNodeTooltip(e as MouseEvent, node);
@@ -803,8 +827,10 @@ export class Visual implements IVisual {
             const sx = e.clientX, sy = e.clientY;
             const ox = node.x,    oy = node.y;
             rect.style.cursor = "grabbing";
+            let hasMoved = false;
 
             const onMove = (ev: MouseEvent) => {
+                if (Math.abs(ev.clientX - sx) > 5 || Math.abs(ev.clientY - sy) > 5) hasMoved = true;
                 node.x = ox + (ev.clientX - sx);
                 node.y = oy + (ev.clientY - sy);
                 this.syncNodeDOM(g, node);
@@ -823,6 +849,7 @@ export class Visual implements IVisual {
                 this.persistPositions();
                 document.removeEventListener("mousemove", onMove);
                 document.removeEventListener("mouseup", onUp);
+                if (!hasMoved) this.handleNodeClick(node.id);
             };
             document.addEventListener("mousemove", onMove);
             document.addEventListener("mouseup", onUp);
@@ -961,6 +988,29 @@ export class Visual implements IVisual {
         text.setAttribute("fill", "#888");
         text.textContent = msg;
         this.svg.appendChild(text);
+    }
+
+    private handleNodeClick(nodeId: string) {
+        if (this.selectedNodeId === nodeId) {
+            this.selectionManager.clear();
+            this.selectedNodeId = null;
+        } else {
+            const ids = this.links
+                .filter(l => l.source === nodeId || l.target === nodeId)
+                .map(l => l.selectionId!)
+                .filter(Boolean);
+            this.selectionManager.select(ids);
+            this.selectedNodeId = nodeId;
+        }
+        this.nodeRects.forEach((r, id) => {
+            if (id === this.selectedNodeId) {
+                r.setAttribute("stroke", "#1565C0");
+                r.setAttribute("stroke-width", "2.5");
+            } else {
+                r.removeAttribute("stroke");
+                r.removeAttribute("stroke-width");
+            }
+        });
     }
 
     private showNodeTooltip(e: MouseEvent, node: SankeyNode) {
