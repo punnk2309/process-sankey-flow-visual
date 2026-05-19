@@ -89,10 +89,10 @@ export class Visual implements IVisual {
 
         this.tooltip = document.createElement("div");
         this.tooltip.style.cssText = [
-            "position:fixed","background:rgba(0,0,0,0.82)","color:#fff",
-            "padding:6px 10px","border-radius:4px","font-size:12px",
+            "position:fixed","background:rgba(0,0,0,0.85)","color:#fff",
+            "padding:8px 12px","border-radius:5px","font-size:12px",
             "font-family:Segoe UI,sans-serif","pointer-events:none",
-            "z-index:9999","white-space:nowrap","display:none"
+            "z-index:9999","display:none","min-width:180px"
         ].join(";");
         document.body.appendChild(this.tooltip);
     }
@@ -721,7 +721,7 @@ export class Visual implements IVisual {
         rect.style.cursor = "grab";
         rect.addEventListener("mouseenter", (e) => {
             rect.setAttribute("fill-opacity", "0.75");
-            this.showTooltip(e as MouseEvent, `${node.label}  |  ${node.value.toLocaleString()}`);
+            this.showNodeTooltip(e as MouseEvent, node);
         });
         rect.addEventListener("mouseleave", () => { rect.removeAttribute("fill-opacity"); this.hideTooltip(); });
         g.appendChild(rect);
@@ -961,6 +961,41 @@ export class Visual implements IVisual {
         text.setAttribute("fill", "#888");
         text.textContent = msg;
         this.svg.appendChild(text);
+    }
+
+    private showNodeTooltip(e: MouseEvent, node: SankeyNode) {
+        const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        const incoming = this.links.filter(l => l.target === node.id && l.source !== node.id);
+        const outgoing = this.links.filter(l => l.source === node.id && l.target !== node.id);
+        const maxRows = Math.max(incoming.length, outgoing.length, 1);
+
+        let html = `<div style="font-weight:600;text-align:center;margin-bottom:6px;padding-bottom:5px;border-bottom:1px solid rgba(255,255,255,0.25)">${esc(node.label)}</div>`;
+        html += `<table style="border-collapse:collapse;width:100%">`;
+        html += `<tr>`;
+        html += `<th style="text-align:left;padding:0 14px 4px 0;opacity:0.65;font-weight:600;font-size:11px;letter-spacing:.04em">FROM</th>`;
+        html += `<th style="text-align:left;padding:0 0 4px 0;opacity:0.65;font-weight:600;font-size:11px;letter-spacing:.04em">TO</th>`;
+        html += `</tr>`;
+
+        for (let i = 0; i < maxRows; i++) {
+            const fromLink = incoming[i];
+            const toLink   = outgoing[i];
+            const fromCell = fromLink
+                ? `<span style="opacity:0.85">${esc(fromLink.source)}</span>&nbsp;<span style="opacity:0.5">→</span>&nbsp;<strong>${fromLink.value.toLocaleString()}</strong>`
+                : `<span style="opacity:0.25">—</span>`;
+            const toCell = toLink
+                ? `<span style="opacity:0.85">${esc(toLink.target)}</span>&nbsp;<span style="opacity:0.5">→</span>&nbsp;<strong>${toLink.value.toLocaleString()}</strong>`
+                : `<span style="opacity:0.25">—</span>`;
+            html += `<tr>`;
+            html += `<td style="padding:2px 14px 2px 0;white-space:nowrap">${fromCell}</td>`;
+            html += `<td style="padding:2px 0;white-space:nowrap">${toCell}</td>`;
+            html += `</tr>`;
+        }
+
+        html += `</table>`;
+        this.tooltip.innerHTML = html;
+        this.tooltip.style.display = "block";
+        this.tooltip.style.left = `${e.clientX + 14}px`;
+        this.tooltip.style.top  = `${e.clientY - 34}px`;
     }
 
     private showTooltip(e: MouseEvent, content: string) {
