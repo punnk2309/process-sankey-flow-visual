@@ -780,11 +780,8 @@ export class Visual implements IVisual {
             rect.setAttribute("stroke", "#1565C0");
             rect.setAttribute("stroke-width", "2.5");
         }
-        rect.addEventListener("mouseenter", (e) => {
-            rect.setAttribute("fill-opacity", "0.75");
-            this.showNodeTooltip(e as MouseEvent, node);
-        });
-        rect.addEventListener("mouseleave", () => { rect.removeAttribute("fill-opacity"); this.hideTooltip(); });
+        rect.addEventListener("mouseenter", () => rect.setAttribute("fill-opacity", "0.75"));
+        rect.addEventListener("mouseleave", () => rect.removeAttribute("fill-opacity"));
         g.appendChild(rect);
 
         // [1] Label text — clipped to stay within SVG
@@ -1057,7 +1054,7 @@ export class Visual implements IVisual {
 
         const body = document.createElement("div");
         body.style.cssText = "padding:8px 12px";
-        body.appendChild(this.buildFromToTable(nodeId, "panel"));
+        body.appendChild(this.buildFromToTable(nodeId));
         this.panel.appendChild(body);
 
         if (wasHidden) {
@@ -1089,8 +1086,7 @@ export class Visual implements IVisual {
         });
     }
 
-    private buildFromToTable(nodeId: string, variant: "panel" | "tooltip"): HTMLTableElement {
-        const isPnl = variant === "panel";
+    private buildFromToTable(nodeId: string): HTMLTableElement {
         const incoming = this.links.filter(l => l.target === nodeId && l.source !== nodeId);
         const outgoing = this.links.filter(l => l.source === nodeId && l.target !== nodeId);
         const maxRows = Math.max(incoming.length, outgoing.length, 1);
@@ -1102,9 +1098,7 @@ export class Visual implements IVisual {
         for (const label of ["FROM", "TO"]) {
             const th = document.createElement("th");
             th.textContent = label;
-            th.style.cssText = isPnl
-                ? `text-align:left;padding:0 ${label === "FROM" ? "14px" : "0"} 5px 0;opacity:0.55;font-weight:600;font-size:10px;letter-spacing:.08em`
-                : `text-align:left;padding:0 ${label === "FROM" ? "14px" : "0"} 4px 0;opacity:0.65;font-weight:600;font-size:11px;letter-spacing:.04em`;
+            th.style.cssText = `text-align:left;padding:0 ${label === "FROM" ? "14px" : "0"} 5px 0;opacity:0.55;font-weight:600;font-size:10px;letter-spacing:.08em`;
             hRow.appendChild(th);
         }
         table.appendChild(hRow);
@@ -1115,8 +1109,8 @@ export class Visual implements IVisual {
             if (name !== undefined) {
                 td.appendChild(document.createTextNode(name + " "));
                 const arr = document.createElement("span");
-                arr.style.opacity = isPnl ? "0.4" : "0.5";
-                arr.textContent = "→";
+                arr.style.opacity = "0.4";
+                arr.textContent = ":";
                 td.appendChild(arr);
                 const b = document.createElement("b");
                 b.textContent = " " + val!.toLocaleString();
@@ -1130,28 +1124,13 @@ export class Visual implements IVisual {
             return td;
         };
 
-        const pad = isPnl ? "3px" : "2px";
         for (let i = 0; i < maxRows; i++) {
             const tr = document.createElement("tr");
-            tr.appendChild(flowCell(incoming[i]?.source, incoming[i]?.value, `padding:${pad} 14px ${pad} 0;white-space:nowrap`));
-            tr.appendChild(flowCell(outgoing[i]?.target, outgoing[i]?.value, `padding:${pad} 0;white-space:nowrap`));
+            tr.appendChild(flowCell(incoming[i]?.source, incoming[i]?.value, "padding:3px 14px 3px 0;white-space:nowrap"));
+            tr.appendChild(flowCell(outgoing[i]?.target, outgoing[i]?.value, "padding:3px 0;white-space:nowrap"));
             table.appendChild(tr);
         }
         return table;
-    }
-
-    private showNodeTooltip(e: MouseEvent, node: SankeyNode) {
-        while (this.tooltip.firstChild) this.tooltip.removeChild(this.tooltip.firstChild);
-
-        const header = document.createElement("div");
-        header.style.cssText = "font-weight:600;text-align:center;margin-bottom:6px;padding-bottom:5px;border-bottom:1px solid rgba(255,255,255,0.25)";
-        header.textContent = node.label;
-        this.tooltip.appendChild(header);
-        this.tooltip.appendChild(this.buildFromToTable(node.id, "tooltip"));
-
-        this.tooltip.style.display = "block";
-        this.tooltip.style.left = `${e.clientX + 14}px`;
-        this.tooltip.style.top  = `${e.clientY - 34}px`;
     }
 
     private showTooltip(e: MouseEvent, content: string) {
